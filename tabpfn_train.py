@@ -1,0 +1,899 @@
+"""
+tabpfn_train.py
+===============
+TabPFN ensemble training and evaluation script with 5-fold cross-validation.
+
+This script is the direct counterpart to ``baseline_logistic_regression.py``,
+``baseline_random_forest.py``, and ``baseline_xgboost.py``.  It trains the
+TabPFN bagging ensemble described in the paper and evaluates it on the full
+natural-distribution test fold.
+
+Key design decisions
+--------------------
+- **Training context oversampling:** each of the *K* = 8 bags is sampled with a
+  60 % positive ratio (24,000 positive + 16,000 negative), pushing the model's
+  in-context prior toward the minority class and achieving Recall₊ = 0.905.
+  This shifts predict_proba's output away from the natural ~18.8 % prevalence,
+  so raw probabilities cannot be read as calibrated transmission risk without
+  correction -- see Calibration below.
+- **Shared evaluation set:** the full test fold is used for evaluation, preserving
+  the natural class distribution and making metrics directly interpretable.
+- **Soft-voting:** the ensemble probability is the arithmetic mean of all bag
+  predicted probabilities.
+- **No data leakage:** the validation fold is kept strictly separate from the
+  training pool; only ``train_fold_N`` is used for context.
+- **Calibration:** the K bags are fit once per fold, then evaluated on both
+  ``val_fold_N`` and ``test_fold_N`` (previously val evaluation was skipped
+  entirely, and re-fitting on val separately would have both doubled training
+  cost and mismatched the model between the two evaluations). An isotonic
+  regression calibrator is fit on the untouched validation fold's ensemble
+  probabilities (never on test), then applied to the test fold's raw
+  probabilities. Brier score, calibration slope/intercept, and expected
+  calibration error (ECE) are reported for both raw and calibrated test
+  probabilities, plus a reliability diagram per fold.
+
+Configuration is loaded from ``config.py``.
+
+Outputs written to ``<OUTPUT_DIR>/improved_bagging_cv/``
+--------------------------------------------------------
+- ``fold_{k}_test_ensemble_metrics.json``   per-fold ensemble metric dict
+- ``fold_{k}_full_results.json``            per-fold complete result dump
+- ``fold_{k}_test_predictions.npy``         shape (n_bags, n_eval) probability array
+- ``fold_{k}_calibration_reliability.png``  raw-vs-calibrated reliability diagram
+- ``tabpfn_cv_summary.csv``                 mean ± std summary across 5 folds
+- ``tabpfn_cv_full_results.json``           complete multi-fold result dump
+
+Usage
+-----
+    python tabpfn_train.py
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.metrics import (roc_auc_score, average_precision_score,
+                             classification_report, confusion_matrix,
+                             log_loss, balanced_accuracy_score,
+                             cohen_kappa_score, matthews_corrcoef,
+                             precision_recall_curve, auc, brier_score_loss,
+                             f1_score, roc_curve)
+from sklearn.calibration import calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+import os
+import json
+import time
+import torch
+import warnings
+from typing import Dict, Tuple, List
+from tabpfn import TabPFNClassifier
+warnings.filterwarnings('ignore')
+
+# Import config
+from config import *
+
+
+# ===========================================================================
+# TRAINING CONFIGURATION
+# ===========================================================================
+CV_CONFIG = {
+    # Cross-validation
+    'folds_to_run': [1, 2, 3, 4, 5],      # All 5 folds
+
+    # Bagging configuration
+    'n_bags': 8,                            # Number of independent bags
+    'bag_train_size': 40000,                # Training samples per bag
+    # Class ratio configuration
+    'train_pos_ratio': 0.5,                 # 50% positive in training bags (val F1+ grid search optimum, see tabpfn_ratio_grid_search.py)
+
+    # Ensemble
+    'ensemble_method': 'soft_voting',
+
+    # Random seed
+    'random_state': 42,
+}
+
+# ===========================================================================
+# CALIBRATION CONFIGURATION
+# ===========================================================================
+# 'isotonic' is non-parametric (no assumed miscalibration shape) and
+# preserves the ensemble's ranking (ROC-AUC is unchanged by calibration --
+# only the probability *scale* is corrected), which is the right property
+# for undoing a class-prior shift from oversampling. 'platt' (logistic
+# regression on the raw probability) is offered as a lower-variance
+# alternative when the validation fold is small.
+CALIBRATION_CONFIG = {
+    'method': 'isotonic',   # 'isotonic' | 'platt'
+    'n_bins': 10,            # bins for ECE and the reliability diagram
+}
+
+# Reuse config.py's TABPFN_PARAMS (device/n_estimators/model_path) rather
+# than a second, independently hardcoded copy -- config.py already fails
+# fast if the local checkpoint at MODEL_PATH is missing, and duplicating
+# the path here risked the two drifting apart (e.g. only one of them
+# getting updated after a checkpoint move).
+TABPFN_MODEL_PARAMS = TABPFN_PARAMS.copy()
+
+
+print("\n" + "="*80)
+print("TabPFN IMPROVED BAGGING — 5-FOLD CROSS-VALIDATION")
+print("="*80)
+print(f"  Folds:            {CV_CONFIG['folds_to_run']}")
+print(f"  Bags/fold:        {CV_CONFIG['n_bags']}")
+print(f"  Train size/bag:   {CV_CONFIG['bag_train_size']:,}  ({CV_CONFIG['train_pos_ratio']*100:.0f}% positive)")
+print("  Eval:             full natural-distribution test set")
+print(f"  Ensemble method:  {CV_CONFIG['ensemble_method']}")
+print(f"  Device:           {TABPFN_MODEL_PARAMS['device']}")
+print("="*80 + "\n")
+
+
+# ===========================================================================
+# DATA LOADING  (train / val / test kept separate — no leakage)
+# ===========================================================================
+def load_fold_data(fold: int):
+    """
+    Load one fold keeping train / val / test separate.
+    Training pool = train_fold_N only (val is held out for evaluation).
+    """
+    base_path = FOLDS_PATH
+    drop_cols  = DROP_COLS_BASE + DELETED_COLS
+    label_col  = 'label'
+
+    train_df = pd.read_csv(f'{base_path}/train_fold_{fold}.csv', encoding='latin1')
+    val_df   = pd.read_csv(f'{base_path}/val_fold_{fold}.csv',   encoding='latin1')
+    test_df  = pd.read_csv(f'{base_path}/test_fold_{fold}.csv',  encoding='latin1')
+
+    for df in [train_df, val_df, test_df]:
+        df.drop(columns=drop_cols, errors='ignore', inplace=True)
+        df['label'] = (df['secondary_cases_count'] > 0).astype(int)
+        df.drop('secondary_cases_count', axis=1, inplace=True)
+
+    feature_names = [c for c in train_df.columns if c != label_col]
+
+    for df in [train_df, val_df, test_df]:
+        df.reset_index(drop=True, inplace=True)
+
+    def _stats(df, name):
+        n_pos = (df['label'] == 1).sum()
+        return (f"{name}: {len(df):,} samples  "
+                f"(pos {n_pos:,} / {n_pos/len(df):.1%},"
+                f" neg {(df['label']==0).sum():,} / {(df['label']==0).mean():.1%})")
+
+    print(f"\n{'='*80}")
+    print(f"Fold {fold} — Data Loaded")
+    print(f"{'='*80}")
+    print(f"  {_stats(train_df, 'Train')}")
+    print(f"  {_stats(val_df,   'Val  ')}")
+    print(f"  {_stats(test_df,  'Test ')}")
+    print(f"  Features: {len(feature_names):,}")
+
+    return train_df, val_df, test_df, feature_names
+
+
+# ===========================================================================
+# SAMPLING
+# ===========================================================================
+def sample_with_ratio(df: pd.DataFrame, target_size: int, pos_ratio: float,
+                      random_state: int = 42, tag: str = ''):
+    """Sample data with a specific positive class ratio (without replacement)."""
+    np.random.seed(random_state)
+
+    n_pos_target = int(target_size * pos_ratio)
+    n_neg_target = target_size - n_pos_target
+
+    pos_samples = df[df['label'] == 1]
+    neg_samples = df[df['label'] == 0]
+
+    n_pos_avail = len(pos_samples)
+    n_neg_avail = len(neg_samples)
+
+    if n_pos_avail < n_pos_target:
+        print(f"    WARNING [{tag}]: pos requested {n_pos_target:,} > available {n_pos_avail:,}")
+        n_pos_target = n_pos_avail
+        n_neg_target = target_size - n_pos_target
+
+    if n_neg_avail < n_neg_target:
+        print(f"    WARNING [{tag}]: neg requested {n_neg_target:,} > available {n_neg_avail:,}")
+        n_neg_target = n_neg_avail
+        n_pos_target = target_size - n_neg_target
+
+    sampled = pd.concat([
+        pos_samples.sample(n=n_pos_target, replace=False, random_state=random_state),
+        neg_samples.sample(n=n_neg_target, replace=False, random_state=random_state),
+    ])
+    sampled = sampled.sample(frac=1, random_state=random_state).reset_index(drop=True)
+
+    actual_pos = sampled['label'].mean()
+    print(f"    [{tag}] {len(sampled):,} samples  pos={actual_pos:.1%}")
+    return sampled
+
+
+def select_threshold(y_true, y_prob, grid=None):
+    """
+    Grid-search the decision threshold that maximises positive-class F1 on
+    the given (validation) set -- the same validation-only criterion used by
+    every baseline script (baseline_xgboost.py etc.), so TabPFN's reported
+    threshold is chosen under the identical protocol rather than the
+    implicit 0.5 cutoff.
+
+    Returns (best_threshold, best_val_f1).
+    """
+    if grid is None:
+        grid = np.linspace(0.01, 0.99, 99)
+    best_t, best_f1 = 0.5, -1.0
+    for t in grid:
+        pred = (y_prob >= t).astype(int)
+        f1 = f1_score(y_true, pred, pos_label=1, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return float(best_t), float(best_f1)
+
+
+def recall_at_specificity(y_true, y_prob, target_specificity):
+    """
+    Highest recall (sensitivity) achievable at >= target_specificity, read
+    off the full ROC curve (specificity-matched
+    performance, threshold-independent complement to the single selected-
+    threshold operating point reported elsewhere). Same method as every
+    baseline script's recall_at_specificity().
+    """
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    specificity = 1 - fpr
+    mask = specificity >= target_specificity
+    if not mask.any():
+        return float('nan')
+    return float(tpr[mask].max())
+
+
+# ===========================================================================
+# METRICS  (matches XGBoost's compute_detailed_metrics output keys)
+# ===========================================================================
+def compute_metrics(y_true, y_pred, y_prob):
+    """Return metric dict with the same key names as the XGBoost script."""
+    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    cm     = confusion_matrix(y_true, y_pred)
+
+    y_prob_2d = np.column_stack([1 - y_prob, y_prob])
+
+    roc_auc  = roc_auc_score(y_true, y_prob)
+    pr_auc     = average_precision_score(y_true, y_prob)
+
+    result = {
+        # ── Overall ──────────────────────────────────────────────────────
+        'accuracy':          float((y_true == y_pred).mean()),
+        'balanced_accuracy': float(balanced_accuracy_score(y_true, y_pred)),
+        'cohen_kappa':       float(cohen_kappa_score(y_true, y_pred)),
+        'mcc':               float(matthews_corrcoef(y_true, y_pred)),
+        'log_loss':          float(log_loss(y_true, y_prob_2d)),
+
+        # ── Macro ─────────────────────────────────────────────────────────
+        'roc_auc':       float(roc_auc),
+        'macro_pr_auc':    float(pr_auc),
+        'macro_f1':        float(report['macro avg']['f1-score']),
+        'macro_precision': float(report['macro avg']['precision']),
+        'macro_recall':    float(report['macro avg']['recall']),
+        'weighted_f1':     float(report['weighted avg']['f1-score']),
+
+        # ── Confusion matrix ──────────────────────────────────────────────
+        'confusion_matrix': cm.tolist(),
+        'confusion_matrix_tn': int(cm[0, 0]),
+        'confusion_matrix_fp': int(cm[0, 1]),
+        'confusion_matrix_fn': int(cm[1, 0]),
+        'confusion_matrix_tp': int(cm[1, 1]),
+    }
+
+    # Per-class metrics (class 0 & 1)
+    for cls in range(2):
+        cls_key = str(cls)
+        result[f'class_{cls}_precision'] = float(report.get(cls_key, {}).get('precision', np.nan))
+        result[f'class_{cls}_recall']    = float(report.get(cls_key, {}).get('recall',    np.nan))
+        result[f'class_{cls}_f1']        = float(report.get(cls_key, {}).get('f1-score',  np.nan))
+        result[f'class_{cls}_support']   = int  (report.get(cls_key, {}).get('support',   0))
+
+        try:
+            if cls == 1:
+                result[f'class_{cls}_auc']    = float(roc_auc_score(y_true, y_prob))
+                result[f'class_{cls}_pr_auc'] = float(average_precision_score(y_true, y_prob))
+            else:
+                result[f'class_{cls}_auc']    = float(roc_auc_score((y_true==0).astype(int), 1-y_prob))
+                prec0, rec0, _ = precision_recall_curve((y_true==0).astype(int), 1-y_prob)
+                result[f'class_{cls}_pr_auc'] = float(auc(rec0, prec0))
+        except Exception:
+            result[f'class_{cls}_auc']    = float('nan')
+            result[f'class_{cls}_pr_auc'] = float('nan')
+
+    # Explicit aliases: PPV is class-1
+    # precision, specificity is class-0 recall (true-negative rate) --
+    # matches the aliases added to the baseline scripts.
+    result['ppv']         = result['class_1_precision']
+    result['specificity'] = result['class_0_recall']
+
+    return result
+
+
+def print_metrics(metrics: dict, title: str):
+    print(f"\n{'='*60}")
+    print(f"{title}")
+    print(f"{'='*60}")
+    print(f"ROC-AUC:        {metrics['roc_auc']:.4f}")
+    print(f"Macro F1:         {metrics['macro_f1']:.4f}")
+    print(f"Weighted F1:      {metrics['weighted_f1']:.4f}")
+    print(f"Log Loss:         {metrics['log_loss']:.4f}")
+    print(f"Balanced Acc:     {metrics['balanced_accuracy']:.4f}")
+    print(f"Cohen Kappa:      {metrics['cohen_kappa']:.4f}")
+    print(f"MCC:              {metrics['mcc']:.4f}")
+    print(f"\nClass 1 (Has secondary) Metrics:")
+    print(f"  AUC:            {metrics['class_1_auc']:.4f}")
+    print(f"  PR-AUC:         {metrics['class_1_pr_auc']:.4f}")
+    print(f"  Precision (PPV):{metrics['ppv']:.4f}")
+    print(f"  Recall:         {metrics['class_1_recall']:.4f}")
+    print(f"  Specificity:    {metrics['specificity']:.4f}")
+    print(f"  F1:             {metrics['class_1_f1']:.4f}")
+    cm = metrics['confusion_matrix']
+    print(f"\nConfusion Matrix:")
+    print(f"                    Pred Neg   Pred Pos")
+    print(f"  Actual Negative   {cm[0][0]:8d}   {cm[0][1]:8d}")
+    print(f"  Actual Positive   {cm[1][0]:8d}   {cm[1][1]:8d}")
+
+
+# ===========================================================================
+# CALIBRATION  (fit on validation only, applied to test)
+# ===========================================================================
+def compute_calibration_metrics(y_true, y_prob, n_bins=10):
+    """
+    Brier score, calibration slope/intercept (Cox calibration regression on
+    the logit of y_prob), and Expected Calibration Error (equal-width bins).
+    Reported for both the raw (oversampled-context) and calibrated
+    probabilities so the effect of calibration is directly visible.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_prob = np.asarray(y_prob, dtype=float)
+
+    brier = float(brier_score_loss(y_true, y_prob))
+
+    # Calibration-in-the-large: fit y ~ a + b * logit(p). Perfect
+    # calibration is slope=1, intercept=0.
+    eps = 1e-6
+    p_clipped = np.clip(y_prob, eps, 1 - eps)
+    logit_p = np.log(p_clipped / (1 - p_clipped))
+    lr = LogisticRegression(solver='lbfgs')
+    lr.fit(logit_p.reshape(-1, 1), y_true)
+    cal_slope     = float(lr.coef_[0, 0])
+    cal_intercept = float(lr.intercept_[0])
+
+    # Expected Calibration Error over equal-width bins
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    bin_idx   = np.clip(np.digitize(y_prob, bin_edges[1:-1]), 0, n_bins - 1)
+    ece = 0.0
+    bin_stats = []
+    for b in range(n_bins):
+        mask = bin_idx == b
+        n_b  = int(mask.sum())
+        if n_b == 0:
+            continue
+        mean_pred = float(y_prob[mask].mean())
+        mean_obs  = float(y_true[mask].mean())
+        ece += (n_b / len(y_prob)) * abs(mean_pred - mean_obs)
+        bin_stats.append({'bin': b, 'n': n_b,
+                          'mean_predicted': mean_pred, 'mean_observed': mean_obs})
+
+    return {
+        'brier_score':           brier,
+        'calibration_slope':     cal_slope,
+        'calibration_intercept': cal_intercept,
+        'ece':                   float(ece),
+        'bin_stats':             bin_stats,
+    }
+
+
+def fit_calibrator(y_val, val_prob, method='isotonic'):
+    """Fit a probability calibrator on the (untouched) validation fold only."""
+    val_prob = np.asarray(val_prob, dtype=float)
+    if method == 'isotonic':
+        cal = IsotonicRegression(out_of_bounds='clip')
+        cal.fit(val_prob, y_val)
+    elif method == 'platt':
+        cal = LogisticRegression(solver='lbfgs')
+        cal.fit(val_prob.reshape(-1, 1), y_val)
+    else:
+        raise ValueError(f"Unknown calibration method: {method!r}")
+    return cal
+
+
+def apply_calibrator(cal, prob, method='isotonic'):
+    prob = np.asarray(prob, dtype=float)
+    if method == 'isotonic':
+        return cal.predict(prob)
+    elif method == 'platt':
+        return cal.predict_proba(prob.reshape(-1, 1))[:, 1]
+    raise ValueError(f"Unknown calibration method: {method!r}")
+
+
+def plot_reliability_diagram(y_true, prob_raw, prob_calibrated, out_path,
+                             n_bins=10, title=''):
+    """Reliability diagram comparing raw vs. calibrated test probabilities."""
+    frac_pos_raw, mean_pred_raw = calibration_curve(
+        y_true, prob_raw, n_bins=n_bins, strategy='uniform')
+    frac_pos_cal, mean_pred_cal = calibration_curve(
+        y_true, prob_calibrated, n_bins=n_bins, strategy='uniform')
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1, label='Perfect calibration')
+    ax.plot(mean_pred_raw, frac_pos_raw, 'o-', color='#d62728',
+            label='Raw (oversampled-context)')
+    ax.plot(mean_pred_cal, frac_pos_cal, 's-', color='#1f77b4',
+            label='Calibrated')
+    ax.set_xlabel('Mean predicted probability')
+    ax.set_ylabel('Observed frequency')
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title(title, fontsize=11, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# ===========================================================================
+# BAGGING ENSEMBLE  (fit once per fold; evaluate on as many splits as needed)
+# ===========================================================================
+def fit_bags(train_df: pd.DataFrame, feature_names: list, config: dict):
+    """
+    Fit the K bags once on train_df. Kept separate from evaluation so the
+    same trained ensemble can be scored on both the validation fold (for
+    calibration) and the test fold, instead of re-fitting (and thus
+    doubling training cost) per evaluation split.
+
+    Returns
+    -------
+    models          : list of fitted TabPFNClassifier, one per bag
+    train_idx_used  : set of train_df indices drawn into at least one bag
+    total_fit_time  : summed wall-clock fit time across bags (seconds)
+    """
+    models = []
+    train_idx_used = set()
+    total_fit_time = 0.0
+
+    for bag_id in range(config['n_bags']):
+        print(f"\n  ── Bag {bag_id+1}/{config['n_bags']} ──")
+        bag_seed = config['random_state'] + bag_id * 1000
+
+        print(f"  Sampling training data:")
+        train_sample = sample_with_ratio(
+            train_df,
+            config['bag_train_size'],
+            config['train_pos_ratio'],
+            random_state=bag_seed,
+            tag=f"Train-bag{bag_id+1}",
+        )
+        train_idx_used.update(train_sample.index.tolist())
+
+        X_train = train_sample[feature_names].values
+        y_train = train_sample['label'].values
+
+        t0 = time.time()
+        model = TabPFNClassifier(**TABPFN_MODEL_PARAMS)
+        model.fit(X_train, y_train)
+        fit_time = time.time() - t0
+        total_fit_time += fit_time
+        print(f"  ✓ Fit in {fit_time:.1f}s")
+
+        models.append(model)
+
+    return models, train_idx_used, total_fit_time
+
+
+def predict_with_bags(
+    models:        List,
+    eval_df:       pd.DataFrame,
+    feature_names: list,
+    eval_tag:      str = 'Val',
+) -> Tuple[Dict, List, np.ndarray]:
+    """
+    Score an already-fitted list of bags on eval_df and soft-vote them.
+
+    Returns
+    -------
+    ensemble_metrics  : dict of aggregated ensemble metrics
+    bag_metrics       : list of per-bag metric dicts
+    all_proba         : np.ndarray shape (n_bags, n_eval_samples)
+    """
+    print(f"\n{'='*80}")
+    print(f"Bagging Ensemble — evaluating on {eval_tag}")
+    print(f"{'='*80}")
+
+    # ── Use full eval set (natural distribution) ─────────────────────────
+    X_eval = eval_df[feature_names].values
+    y_eval = eval_df['label'].values
+    print(f"\n  Eval set ({eval_tag}): {len(y_eval):,} samples  "
+          f"pos={y_eval.mean():.1%} (natural distribution)")
+
+    all_proba   = []
+    bag_metrics = []
+    for bag_id, model in enumerate(models):
+        y_proba = model.predict_proba(X_eval)[:, 1]
+        y_pred  = (y_proba > 0.5).astype(int)
+        all_proba.append(y_proba)
+
+        bm = compute_metrics(y_eval, y_pred, y_proba)
+        bm.update({'bag_id': bag_id + 1})
+        bag_metrics.append(bm)
+        print(f"  Bag {bag_id+1}  roc_auc={bm['roc_auc']:.4f}  macro_f1={bm['macro_f1']:.4f}")
+
+    # ── Ensemble via soft voting ───────────────────────────────────────────
+    all_proba_arr   = np.array(all_proba)                   # (n_bags, n_eval)
+    y_prob_ensemble = all_proba_arr.mean(axis=0)
+    y_pred_ensemble = (y_prob_ensemble > 0.5).astype(int)
+
+    ensemble_metrics = compute_metrics(y_eval, y_pred_ensemble, y_prob_ensemble)
+
+    bag_aucs = [m["roc_auc"] for m in bag_metrics]
+    bag_f1s  = [m['macro_f1']  for m in bag_metrics]
+    print(f"\n  Ensemble vs Bags ({eval_tag}):")
+    print(f"    roc_auc    ensemble={ensemble_metrics['roc_auc']:.4f}  "
+          f"best_bag={max(bag_aucs):.4f}  avg={np.mean(bag_aucs):.4f}±{np.std(bag_aucs):.4f}")
+    print(f"    macro_f1   ensemble={ensemble_metrics['macro_f1']:.4f}  "
+          f"best_bag={max(bag_f1s):.4f}  avg={np.mean(bag_f1s):.4f}±{np.std(bag_f1s):.4f}")
+
+    return ensemble_metrics, bag_metrics, all_proba_arr
+
+
+# ===========================================================================
+# MAIN
+# ===========================================================================
+def main():
+    print("\n" + "="*80)
+    print("TabPFN IMPROVED BAGGING — 5-FOLD CROSS-VALIDATION")
+    print("="*80)
+
+    # Device check
+    if TABPFN_MODEL_PARAMS['device'] == 'cuda' and not torch.cuda.is_available():
+        print("WARNING: CUDA not available, falling back to CPU")
+        TABPFN_MODEL_PARAMS['device'] = 'cpu'
+    if TABPFN_MODEL_PARAMS['device'] == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB\n")
+
+    output_dir = os.path.join(OUTPUT_DIR, 'improved_bagging_cv')
+    os.makedirs(output_dir, exist_ok=True)
+
+    all_fold_results = []     # list of dicts, one per fold
+
+    # ─────────────────────────────────────────────────────────────────────
+    for fold in CV_CONFIG['folds_to_run']:
+        print(f"\n{'#'*80}")
+        print(f"# FOLD {fold}")
+        print(f"{'#'*80}")
+
+        try:
+            train_df, val_df, test_df, feature_names = load_fold_data(fold)
+
+            # ── Fit the K bags once, then score them on both splits ───────
+            # (previously val evaluation was disabled to save compute; that
+            # also meant there was no way to calibrate. Fitting once and
+            # scoring twice gives both val and test results for the price
+            # of one training run instead of two.)
+            models, train_idx_used, total_fit_time = fit_bags(
+                train_df, feature_names, CV_CONFIG)
+
+            val_ens, val_bags, val_proba = predict_with_bags(
+                models, val_df, feature_names, eval_tag='Val')
+            print_metrics(val_ens, title=f"FOLD {fold} — VAL SET RESULTS")
+
+            test_ens, test_bags, test_proba = predict_with_bags(
+                models, test_df, feature_names, eval_tag='Test')
+            print_metrics(test_ens, title=f"FOLD {fold} — TEST SET RESULTS")
+
+            ensemble_bookkeeping = {
+                'n_bags':             CV_CONFIG['n_bags'],
+                'bag_train_size':     CV_CONFIG['bag_train_size'],
+                'train_pos_ratio':    CV_CONFIG['train_pos_ratio'],
+                'ensemble_method':    CV_CONFIG['ensemble_method'],
+                'total_fit_time':     total_fit_time,
+                'avg_fit_time':       total_fit_time / CV_CONFIG['n_bags'],
+                'data_coverage_pct':  len(train_idx_used) / len(train_df) * 100,
+            }
+            val_ens.update(ensemble_bookkeeping)
+            test_ens.update(ensemble_bookkeeping)
+
+            # ── Calibration: fit on val (untouched, natural ~18.8% prev.), ─
+            # ── apply to test. Never fit on test.                          ─
+            y_val_ens  = val_df['label'].values
+            y_test_ens = test_df['label'].values
+            cal_method = CALIBRATION_CONFIG['method']
+            n_bins     = CALIBRATION_CONFIG['n_bins']
+
+            val_ens_prob  = np.array(val_proba).mean(axis=0)
+            test_ens_prob = np.array(test_proba).mean(axis=0)
+
+            calibrator = fit_calibrator(y_val_ens, val_ens_prob, method=cal_method)
+            test_prob_calibrated = apply_calibrator(calibrator, test_ens_prob, method=cal_method)
+
+            calib_raw        = compute_calibration_metrics(y_test_ens, test_ens_prob, n_bins=n_bins)
+            calib_calibrated = compute_calibration_metrics(y_test_ens, test_prob_calibrated, n_bins=n_bins)
+
+            # Classification metrics recomputed on calibrated probabilities
+            # at the same 0.5 cutoff -- shows the "honest" operating point
+            # once the oversampling-induced prior shift is corrected. This
+            # does not change ROC-AUC (calibration is monotonic, isotonic
+            # regression in particular), only which side of 0.5 each
+            # household falls on.
+            test_pred_calibrated  = (test_prob_calibrated > 0.5).astype(int)
+            test_metrics_calibrated = compute_metrics(
+                y_test_ens, test_pred_calibrated, test_prob_calibrated)
+
+            calibration_summary = {
+                'method':                cal_method,
+                'n_val_positive':        int(y_val_ens.sum()),
+                'raw':                   calib_raw,
+                'calibrated':            calib_calibrated,
+                'calibrated_classification_metrics': test_metrics_calibrated,
+            }
+
+            print(f"\n{'='*60}")
+            print(f"FOLD {fold} — CALIBRATION (method={cal_method}, "
+                  f"fit on val n_pos={calibration_summary['n_val_positive']:,})")
+            print(f"{'='*60}")
+            print(f"                    Raw        Calibrated")
+            print(f"  Brier score:      {calib_raw['brier_score']:.4f}     {calib_calibrated['brier_score']:.4f}")
+            print(f"  Cal. slope:       {calib_raw['calibration_slope']:.4f}     {calib_calibrated['calibration_slope']:.4f}   (1.0 = perfect)")
+            print(f"  Cal. intercept:   {calib_raw['calibration_intercept']:+.4f}    {calib_calibrated['calibration_intercept']:+.4f}   (0.0 = perfect)")
+            print(f"  ECE:              {calib_raw['ece']:.4f}     {calib_calibrated['ece']:.4f}")
+            print(f"  Recall+ @0.5:     {test_ens['class_1_recall']:.4f}     {test_metrics_calibrated['class_1_recall']:.4f}")
+            print(f"  PPV @0.5:         {test_ens['ppv']:.4f}     {test_metrics_calibrated['ppv']:.4f}")
+
+            reliability_path = os.path.join(
+                output_dir, f'fold_{fold}_calibration_reliability.png')
+            plot_reliability_diagram(
+                y_test_ens, test_ens_prob, test_prob_calibrated,
+                out_path=reliability_path, n_bins=n_bins,
+                title=f'Fold {fold} — Test-set reliability (raw vs. calibrated)')
+
+            # ── Validation-selected threshold (same protocol as every ─────
+            # ── baseline: grid-search max F1+ on val, apply fixed to test) ─
+            # Selected once on raw val probabilities, once on calibrated val
+            # probabilities (each applied to the correspondingly-scaled test
+            # probabilities), so Table 2 no longer reports an implicit,
+            # unselected 0.5 cutoff for TabPFN while every baseline reports a
+            # validation-selected one.
+            val_prob_calibrated = apply_calibrator(calibrator, val_ens_prob, method=cal_method)
+
+            threshold_raw, val_f1_raw = select_threshold(y_val_ens, val_ens_prob)
+            test_pred_selected = (test_ens_prob >= threshold_raw).astype(int)
+            test_metrics_selected = compute_metrics(
+                y_test_ens, test_pred_selected, test_ens_prob)
+
+            threshold_calibrated, val_f1_calibrated = select_threshold(
+                y_val_ens, val_prob_calibrated)
+            test_pred_selected_calibrated = (test_prob_calibrated >= threshold_calibrated).astype(int)
+            test_metrics_selected_calibrated = compute_metrics(
+                y_test_ens, test_pred_selected_calibrated, test_prob_calibrated)
+
+            threshold_summary = {
+                'raw': {
+                    'threshold':      threshold_raw,
+                    'val_f1_plus':    val_f1_raw,
+                    'test_metrics':   test_metrics_selected,
+                },
+                'calibrated': {
+                    'threshold':      threshold_calibrated,
+                    'val_f1_plus':    val_f1_calibrated,
+                    'test_metrics':   test_metrics_selected_calibrated,
+                },
+            }
+
+            print(f"\n{'='*60}")
+            print(f"FOLD {fold} — VALIDATION-SELECTED THRESHOLD (max F1+ on val)")
+            print(f"{'='*60}")
+            print(f"                    Raw        Calibrated")
+            print(f"  Threshold:        {threshold_raw:.3f}      {threshold_calibrated:.3f}")
+            print(f"  Val F1+:          {val_f1_raw:.4f}     {val_f1_calibrated:.4f}")
+            print(f"  Test Recall+:     {test_metrics_selected['class_1_recall']:.4f}     {test_metrics_selected_calibrated['class_1_recall']:.4f}")
+            print(f"  Test PPV:         {test_metrics_selected['ppv']:.4f}     {test_metrics_selected_calibrated['ppv']:.4f}")
+            print(f"  Test F1+:         {test_metrics_selected['class_1_f1']:.4f}     {test_metrics_selected_calibrated['class_1_f1']:.4f}")
+
+            # ── Specificity-matched recall (threshold-independent, read ────
+            # ── off the ROC curve; raw and calibrated probabilities give ───
+            # ── the identical curve since calibration is monotonic, kept ───
+            # ── separately only for symmetry with the tables above) ────────
+            specificity_recall_summary = {
+                'raw': {
+                    'recall_at_80pct_specificity': recall_at_specificity(
+                        y_test_ens, test_ens_prob, 0.80),
+                    'recall_at_90pct_specificity': recall_at_specificity(
+                        y_test_ens, test_ens_prob, 0.90),
+                },
+                'calibrated': {
+                    'recall_at_80pct_specificity': recall_at_specificity(
+                        y_test_ens, test_prob_calibrated, 0.80),
+                    'recall_at_90pct_specificity': recall_at_specificity(
+                        y_test_ens, test_prob_calibrated, 0.90),
+                },
+            }
+            print(f"\n{'='*60}")
+            print(f"FOLD {fold} — SPECIFICITY-MATCHED RECALL")
+            print(f"{'='*60}")
+            print(f"  R@80%spec:        {specificity_recall_summary['raw']['recall_at_80pct_specificity']:.4f}")
+            print(f"  R@90%spec:        {specificity_recall_summary['raw']['recall_at_90pct_specificity']:.4f}")
+
+            # ── Save per-fold artefacts ───────────────────────────────────
+            fold_result = {
+                'fold': fold,
+                'n_features':  len(feature_names),
+                'n_train':     len(train_df),
+                'n_val':       len(val_df),
+                'n_test':      len(test_df),
+                'val':  val_ens,
+                'val_bag_metrics': val_bags,
+                'test': test_ens,
+                'test_bag_metrics': test_bags,
+                'calibration': calibration_summary,
+                'selected_threshold': threshold_summary,
+                'specificity_matched_recall': specificity_recall_summary,
+            }
+
+            with open(os.path.join(output_dir, f'fold_{fold}_test_ensemble_metrics.json'), 'w') as f:
+                json.dump(test_ens, f, indent=2)
+            with open(os.path.join(output_dir, f'fold_{fold}_full_results.json'), 'w') as f:
+                json.dump(fold_result, f, indent=2)
+            np.save(os.path.join(output_dir, f'fold_{fold}_test_predictions.npy'), test_proba)
+
+            all_fold_results.append(fold_result)
+            print(f"\n✓ Fold {fold} complete — results saved to {output_dir}")
+
+        except Exception as e:
+            print(f"\n✗ ERROR fold {fold}: {e}")
+            import traceback; traceback.print_exc()
+            continue
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Build summary CSV (same structure as XGBoost summary)
+    # ─────────────────────────────────────────────────────────────────────
+    if not all_fold_results:
+        print("No results to summarise.")
+        return []
+
+    summary_rows = []
+    for r in all_fold_results:
+        row = {
+            'fold':       r['fold'],
+            'n_train':    r['n_train'],
+            'n_test':     r['n_test'],
+            'n_features': r['n_features'],
+        }
+        m = r['test']
+        row.update({
+            'test_roc_auc':       m['roc_auc'],
+            'test_macro_f1':        m['macro_f1'],
+            'test_weighted_f1':     m['weighted_f1'],
+            'test_log_loss':        m['log_loss'],
+            'test_balanced_acc':    m['balanced_accuracy'],
+            'test_cohen_kappa':     m['cohen_kappa'],
+            'test_mcc':             m['mcc'],
+            'test_ppv':             m['ppv'],
+            'test_specificity':     m['specificity'],
+        })
+        for cls in range(2):
+            row[f'test_class{cls}_auc']       = m.get(f'class_{cls}_auc',       float('nan'))
+            row[f'test_class{cls}_pr_auc']    = m.get(f'class_{cls}_pr_auc',    float('nan'))
+            row[f'test_class{cls}_f1']        = m.get(f'class_{cls}_f1',        float('nan'))
+            row[f'test_class{cls}_recall']    = m.get(f'class_{cls}_recall',    float('nan'))
+            row[f'test_class{cls}_precision'] = m.get(f'class_{cls}_precision', float('nan'))
+
+        cal = r['calibration']
+        row.update({
+            'cal_method':                cal['method'],
+            'cal_brier_raw':             cal['raw']['brier_score'],
+            'cal_brier_calibrated':      cal['calibrated']['brier_score'],
+            'cal_slope_raw':             cal['raw']['calibration_slope'],
+            'cal_slope_calibrated':      cal['calibrated']['calibration_slope'],
+            'cal_intercept_raw':         cal['raw']['calibration_intercept'],
+            'cal_intercept_calibrated':  cal['calibrated']['calibration_intercept'],
+            'cal_ece_raw':               cal['raw']['ece'],
+            'cal_ece_calibrated':        cal['calibrated']['ece'],
+            'cal_recall_calibrated':     cal['calibrated_classification_metrics']['class_1_recall'],
+            'cal_ppv_calibrated':        cal['calibrated_classification_metrics']['ppv'],
+        })
+
+        th = r['selected_threshold']
+        row.update({
+            'sel_threshold_raw':          th['raw']['threshold'],
+            'sel_val_f1_plus_raw':        th['raw']['val_f1_plus'],
+            'sel_test_recall_raw':        th['raw']['test_metrics']['class_1_recall'],
+            'sel_test_ppv_raw':           th['raw']['test_metrics']['ppv'],
+            'sel_test_f1_plus_raw':       th['raw']['test_metrics']['class_1_f1'],
+            'sel_threshold_calibrated':   th['calibrated']['threshold'],
+            'sel_val_f1_plus_calibrated': th['calibrated']['val_f1_plus'],
+            'sel_test_recall_calibrated': th['calibrated']['test_metrics']['class_1_recall'],
+            'sel_test_ppv_calibrated':    th['calibrated']['test_metrics']['ppv'],
+            'sel_test_f1_plus_calibrated': th['calibrated']['test_metrics']['class_1_f1'],
+        })
+
+        spec = r['specificity_matched_recall']
+        row.update({
+            'recall_at_80pct_specificity_raw':        spec['raw']['recall_at_80pct_specificity'],
+            'recall_at_90pct_specificity_raw':         spec['raw']['recall_at_90pct_specificity'],
+            'recall_at_80pct_specificity_calibrated':  spec['calibrated']['recall_at_80pct_specificity'],
+            'recall_at_90pct_specificity_calibrated':  spec['calibrated']['recall_at_90pct_specificity'],
+        })
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(output_dir, 'tabpfn_cv_summary.csv')
+    summary_df.to_csv(summary_path, index=False)
+
+    # Full JSON dump
+    full_json_path = os.path.join(output_dir, 'tabpfn_cv_full_results.json')
+    with open(full_json_path, 'w') as f:
+        json.dump(all_fold_results, f, indent=2)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Console summary — mirrors XGBoost print format exactly
+    # ─────────────────────────────────────────────────────────────────────
+    print("\n" + "="*80)
+    print("TabPFN IMPROVED BAGGING — 5-FOLD CROSS-VALIDATION RESULTS")
+    print("="*80)
+
+    print(f"\n{'='*60}")
+    print(f"TEST SET — AVERAGED ACROSS {len(summary_df)} FOLDS:")
+    print(f"{'='*60}")
+    print(f"ROC-AUC:           {summary_df['test_roc_auc'].mean():.4f} ± {summary_df['test_roc_auc'].std():.4f}")
+    print(f"Macro F1:            {summary_df['test_macro_f1'].mean():.4f} ± {summary_df['test_macro_f1'].std():.4f}")
+    print(f"Weighted F1:         {summary_df['test_weighted_f1'].mean():.4f} ± {summary_df['test_weighted_f1'].std():.4f}")
+    print(f"Log Loss:            {summary_df['test_log_loss'].mean():.4f} ± {summary_df['test_log_loss'].std():.4f}")
+    print(f"Balanced Accuracy:   {summary_df['test_balanced_acc'].mean():.4f} ± {summary_df['test_balanced_acc'].std():.4f}")
+    print(f"Cohen Kappa:         {summary_df['test_cohen_kappa'].mean():.4f} ± {summary_df['test_cohen_kappa'].std():.4f}")
+    print(f"MCC:                 {summary_df['test_mcc'].mean():.4f} ± {summary_df['test_mcc'].std():.4f}")
+    print(f"\nClass 1 (Has secondary) Metrics:")
+    print(f"  AUC:               {summary_df['test_class1_auc'].mean():.4f} ± {summary_df['test_class1_auc'].std():.4f}")
+    print(f"  PR-AUC:            {summary_df['test_class1_pr_auc'].mean():.4f} ± {summary_df['test_class1_pr_auc'].std():.4f}")
+    print(f"  F1:                {summary_df['test_class1_f1'].mean():.4f} ± {summary_df['test_class1_f1'].std():.4f}")
+    print(f"  Recall:            {summary_df['test_class1_recall'].mean():.4f} ± {summary_df['test_class1_recall'].std():.4f}")
+    print(f"  Precision (PPV):   {summary_df['test_ppv'].mean():.4f} ± {summary_df['test_ppv'].std():.4f}")
+    print(f"  Specificity:       {summary_df['test_specificity'].mean():.4f} ± {summary_df['test_specificity'].std():.4f}")
+
+    print(f"\n{'='*60}")
+    print(f"CALIBRATION — AVERAGED ACROSS {len(summary_df)} FOLDS "
+          f"(method={summary_df['cal_method'].iloc[0]}):")
+    print(f"{'='*60}")
+    print(f"                    Raw                Calibrated")
+    print(f"  Brier score:      {summary_df['cal_brier_raw'].mean():.4f} ± {summary_df['cal_brier_raw'].std():.4f}   "
+          f"{summary_df['cal_brier_calibrated'].mean():.4f} ± {summary_df['cal_brier_calibrated'].std():.4f}")
+    print(f"  Cal. slope:       {summary_df['cal_slope_raw'].mean():.4f} ± {summary_df['cal_slope_raw'].std():.4f}   "
+          f"{summary_df['cal_slope_calibrated'].mean():.4f} ± {summary_df['cal_slope_calibrated'].std():.4f}   (1.0 = perfect)")
+    print(f"  Cal. intercept:   {summary_df['cal_intercept_raw'].mean():+.4f} ± {summary_df['cal_intercept_raw'].std():.4f}  "
+          f"{summary_df['cal_intercept_calibrated'].mean():+.4f} ± {summary_df['cal_intercept_calibrated'].std():.4f}  (0.0 = perfect)")
+    print(f"  ECE:              {summary_df['cal_ece_raw'].mean():.4f} ± {summary_df['cal_ece_raw'].std():.4f}   "
+          f"{summary_df['cal_ece_calibrated'].mean():.4f} ± {summary_df['cal_ece_calibrated'].std():.4f}")
+    print(f"\n  At calibrated probabilities, 0.5 cutoff:")
+    print(f"    Recall+:        {summary_df['cal_recall_calibrated'].mean():.4f} ± {summary_df['cal_recall_calibrated'].std():.4f}")
+    print(f"    PPV:            {summary_df['cal_ppv_calibrated'].mean():.4f} ± {summary_df['cal_ppv_calibrated'].std():.4f}")
+
+    print(f"\n{'='*60}")
+    print(f"VALIDATION-SELECTED THRESHOLD — AVERAGED ACROSS {len(summary_df)} FOLDS "
+          f"(max F1+ on val, same protocol as baselines):")
+    print(f"{'='*60}")
+    print(f"                    Raw                Calibrated")
+    print(f"  Threshold:        {summary_df['sel_threshold_raw'].mean():.3f} ± {summary_df['sel_threshold_raw'].std():.3f}       "
+          f"{summary_df['sel_threshold_calibrated'].mean():.3f} ± {summary_df['sel_threshold_calibrated'].std():.3f}")
+    print(f"  Val F1+:          {summary_df['sel_val_f1_plus_raw'].mean():.4f} ± {summary_df['sel_val_f1_plus_raw'].std():.4f}     "
+          f"{summary_df['sel_val_f1_plus_calibrated'].mean():.4f} ± {summary_df['sel_val_f1_plus_calibrated'].std():.4f}")
+    print(f"  Test Recall+:     {summary_df['sel_test_recall_raw'].mean():.4f} ± {summary_df['sel_test_recall_raw'].std():.4f}     "
+          f"{summary_df['sel_test_recall_calibrated'].mean():.4f} ± {summary_df['sel_test_recall_calibrated'].std():.4f}")
+    print(f"  Test PPV:         {summary_df['sel_test_ppv_raw'].mean():.4f} ± {summary_df['sel_test_ppv_raw'].std():.4f}     "
+          f"{summary_df['sel_test_ppv_calibrated'].mean():.4f} ± {summary_df['sel_test_ppv_calibrated'].std():.4f}")
+    print(f"  Test F1+:         {summary_df['sel_test_f1_plus_raw'].mean():.4f} ± {summary_df['sel_test_f1_plus_raw'].std():.4f}     "
+          f"{summary_df['sel_test_f1_plus_calibrated'].mean():.4f} ± {summary_df['sel_test_f1_plus_calibrated'].std():.4f}")
+
+    print(f"\n{'='*80}")
+    print(f"Results saved to:  {output_dir}")
+    print(f"  • Summary CSV    : {summary_path}")
+    print(f"  • Full JSON      : {full_json_path}")
+    print(f"  • Reliability diagrams: {output_dir}/fold_*_calibration_reliability.png")
+    print("="*80 + "\n")
+
+    return all_fold_results
+
+
+if __name__ == "__main__":
+    results = main()
