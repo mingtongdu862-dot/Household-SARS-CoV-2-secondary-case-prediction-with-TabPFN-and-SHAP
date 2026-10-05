@@ -70,8 +70,17 @@ class Config:
     ENCODING = 'latin1'
     
     # Time windows for dynamic features (days)
-    INERA_WINDOW = 365  # 1 year before the reference date
-    LMED_WINDOW = 365   # 1 year before the reference date
+    # Prescriptions and 1177 contacts: the 365 days up to and including the
+    # anchor date. data_preprocessing.py keeps both tables from
+    # 2018-12-31 (= earliest anchor date 2019-12-31 minus 365 days) so that
+    # the full window is available for every household;
+    # check_lookback_coverage() verifies this at run time.
+    INERA_WINDOW = 365
+    LMED_WINDOW = 365
+    # Elderly-care (SOL/TRYGG) records are monthly: counted for the completed
+    # months that start within the 365 days before the anchor date. The SOL
+    # extract starts 2019-01, which covers this window for every anchor date.
+    TRYGG_WINDOW = 365
     # OV/SV (outpatient/inpatient diagnoses) have no lower bound (all-time
     # history), but are always upper-bounded at the reference date below --
     # see count_codes(). Earlier versions applied no date filter at all for
@@ -80,8 +89,8 @@ class Config:
     # Which reference date to anchor dynamic (medical-history) features to:
     #   'individual' -- each member's own IndexDate (own first diagnosis for
     #                    infected members, latest household index date for
-    #                    uninfected members). This is what the published
-    #                    results use, but for secondary cases it falls after
+    #                    uninfected members). Used in an earlier version of
+    #                    the analysis; for secondary cases it falls after
     #                    the household's outbreak began, so any diagnosis,
     #                    prescription, or contact recorded between the
     #                    household's first case and that member's own
@@ -91,8 +100,8 @@ class Config:
     #                    earliest infection date in that household
     #                    (HouseholdAnchorDate), so no member's features can
     #                    reflect anything observed after the household's
-    #                    transmission episode started. Use this for the
-    #                    leakage-free sensitivity analysis.
+    #                    transmission episode started. Used for all
+    #                    reported results.
     ANCHOR_MODE = 'household'  # 'individual' | 'household'
 
     # Feature extraction flags
@@ -301,23 +310,54 @@ def count_codes(
     return counts
 
 
-def count_trygg(person_id: str, sol_dict: Dict) -> Tuple[int, int]:
+def _period_month_start(period: Any) -> pd.Timestamp:
+    """Parse a SOL PERIOD value (YYYYMM, int or str) to the first day of that month."""
+    try:
+        text = str(int(float(period)))
+        return pd.Timestamp(year=int(text[:4]), month=int(text[4:6]), day=1)
+    except (TypeError, ValueError):
+        return pd.NaT
+
+
+def count_trygg(person_id: str, sol_dict: Dict, index_date: Any = None,
+                window_days: Optional[int] = None) -> Tuple[int, int]:
     """
-    Count TRYGG indicators for a person.
-    
+    Count TRYGG (municipal elderly-care / security-alarm) records for a person.
+
+    SOL records are monthly (PERIOD = YYYYMM). Only months that ended before
+    the anchor date are counted: the anchor month itself is excluded because
+    a monthly record cannot be placed before or after the anchor date. With
+    window_days, only months starting within that many days before the anchor
+    date are counted. (An earlier version counted every record in the
+    extract, including months after the anchor date.)
+
     Args:
-        person_id: Person identifier
-        sol_dict: Dictionary with TRYGG data
-        
+        person_id:  Person identifier
+        sol_dict:   Dictionary with TRYGG data
+        index_date: Anchor date; if None, no upper bound is applied
+        window_days: Optional look-back window in days
+
     Returns:
         Tuple of (trygg_1_count, total_count)
     """
     if person_id not in sol_dict or not sol_dict[person_id]:
         return 0, 0
-    
-    total = len(sol_dict[person_id])
-    trygg_1 = sum(1 for entry in sol_dict[person_id] if entry.get('TRYGG') == 1)
-    
+
+    anchor = parse_date(index_date) if index_date is not None else pd.NaT
+    earliest = (anchor - timedelta(days=window_days)
+                if (window_days and not pd.isna(anchor)) else None)
+    trygg_1, total = 0, 0
+    for entry in sol_dict[person_id]:
+        if not pd.isna(anchor):
+            month_start = _period_month_start(entry.get('PERIOD'))
+            if pd.isna(month_start) or month_start + pd.offsets.MonthBegin(1) > anchor:
+                continue   # month not completed before the anchor date
+            if earliest is not None and month_start < earliest:
+                continue   # month starts before the look-back window
+        total += 1
+        if entry.get('TRYGG') == 1:
+            trygg_1 += 1
+
     return trygg_1, total
 
 
@@ -470,13 +510,13 @@ def load_unique_codes() -> Dict[str, set]:
     
     if Config.EXTRACT_INERA:
         unique_codes['contact_reasons'] = load_unique_codes_from_csv(
-            os.path.join(Config.FEATURES_DIR, 'Inera_VPTU_Coronadata_2019_2020.csv'),
+            os.path.join(Config.FEATURES_DIR, 'Inera_VPTU_Coronadata_2018_2020.csv'),
             'contactReason'
         )
     
     if Config.EXTRACT_LMED:
         unique_codes['atc_codes'] = load_unique_codes_from_csv(
-            os.path.join(Config.FEATURES_DIR, 'SWECOV_SOS_LMED_2019_2020.csv'),
+            os.path.join(Config.FEATURES_DIR, 'SWECOV_SOS_LMED_2018_2020.csv'),
             'ATC'
         )
     
@@ -524,7 +564,8 @@ def extract_dynamic_features_chunk(
         
         # TRYGG features
         if Config.EXTRACT_TRYGG and 'sol' in feature_dicts:
-            trygg_1, trygg_total = count_trygg(person, feature_dicts['sol'])
+            trygg_1, trygg_total = count_trygg(person, feature_dicts['sol'], index_date,
+                                               Config.TRYGG_WINDOW)
             row['TRYGG_1'] = trygg_1
             row['TRYGG_total'] = trygg_total
         
@@ -573,6 +614,36 @@ def extract_dynamic_features_chunk(
     return pd.DataFrame(count_data)
 
 
+def check_lookback_coverage(code_dict: Dict, date_field: str,
+                            person_to_date: Dict[str, Any],
+                            window_days: int, name: str) -> None:
+    """
+    Verify that a look-back window of `window_days` before every anchor date
+    is covered by the register extract. Prints the earliest record date and
+    the share of persons whose window starts before it (i.e. is truncated).
+    A truncated window would make these features depend on calendar time.
+    """
+    dates = {e.get(date_field) for entries in code_dict.values() for e in entries}
+    parsed = [parse_date(d) for d in dates if d is not None]
+    parsed = [d for d in parsed if not pd.isna(d)]
+    if not parsed:
+        print(f"  [coverage] {name}: no dated records found")
+        return
+    earliest = min(parsed)
+    anchors = pd.to_datetime(pd.Series(list(person_to_date.values())), errors='coerce').dropna()
+    window_start = anchors - pd.Timedelta(days=window_days)
+    truncated = float((window_start < earliest).mean())
+    print(f"  [coverage] {name}: earliest record {earliest.date()}, "
+          f"earliest window start {window_start.min().date()}, "
+          f"truncated windows: {truncated:.1%}")
+    if truncated > 0:
+        warnings.warn(
+            f"{name}: the extract starts on {earliest.date()}, so the "
+            f"{window_days}-day look-back window is truncated for "
+            f"{truncated:.1%} of persons. Extend the extract (see "
+            f"data_preprocessing.py: Config.LOOKBACK_START).")
+
+
 def extract_dynamic_features(df: pd.DataFrame, unique_codes: Dict[str, set]) -> None:
     """
     Extract dynamic features (medical codes, medications) in chunks.
@@ -593,12 +664,12 @@ def extract_dynamic_features(df: pd.DataFrame, unique_codes: Dict[str, set]) -> 
     
     if Config.EXTRACT_INERA:
         feature_dicts['inera'] = load_pickle_dict(
-            os.path.join(Config.FEATURES_DIR, 'Inera_VPTU_Coronadata_2019_2020_duplicates.pkl')
+            os.path.join(Config.FEATURES_DIR, 'Inera_VPTU_Coronadata_2018_2020_duplicates.pkl')
         )
     
     if Config.EXTRACT_LMED:
         feature_dicts['lmed'] = load_pickle_dict(
-            os.path.join(Config.FEATURES_DIR, 'SWECOV_SOS_LMED_2019_2020_duplicates.pkl')
+            os.path.join(Config.FEATURES_DIR, 'SWECOV_SOS_LMED_2018_2020_duplicates.pkl')
         )
     
     if Config.EXTRACT_OV:
@@ -618,10 +689,9 @@ def extract_dynamic_features(df: pd.DataFrame, unique_codes: Dict[str, set]) -> 
     
     print_memory_usage("After loading dictionaries")
     
-    # Create person_id to date mapping. ANCHOR_MODE='household' anchors every
-    # household member's dynamic features to the household's single earliest
-    # infection date (leakage-free sensitivity analysis); the default
-    # 'individual' mode reproduces the originally published behaviour.
+    # Create person_id to date mapping. ANCHOR_MODE='household' (default, used
+    # for all reported results) anchors every household member's dynamic
+    # features to the household's single earliest infection date.
     print(f"Creating person-to-date mapping (ANCHOR_MODE='{Config.ANCHOR_MODE}')...")
     if Config.ANCHOR_MODE == 'household':
         if 'HouseholdAnchorDate' not in df.columns:
@@ -637,6 +707,14 @@ def extract_dynamic_features(df: pd.DataFrame, unique_codes: Dict[str, set]) -> 
         raise ValueError(f"Unknown Config.ANCHOR_MODE: {Config.ANCHOR_MODE!r} "
                          f"(expected 'individual' or 'household')")
     
+    # Verify that the look-back windows are fully covered by the extracts
+    if 'inera' in feature_dicts:
+        check_lookback_coverage(feature_dicts['inera'], 'documentCreatedTime',
+                                person_to_date, Config.INERA_WINDOW, 'Inera (1177)')
+    if 'lmed' in feature_dicts:
+        check_lookback_coverage(feature_dicts['lmed'], 'CodeDate',
+                                person_to_date, Config.LMED_WINDOW, 'LMED (prescriptions)')
+
     # Setup output
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
     output_path = os.path.join(Config.OUTPUT_DIR, Config.OUTPUT_FILE)
