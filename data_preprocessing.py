@@ -73,6 +73,21 @@ class Config:
     OUTPUT_DIR_FEATURES = os.environ.get('SWECOV_FEATURES_DIR', 'Features_Selected_Data')
     OUTPUT_DIR_INDEX = f'Index(InD={INCUBATION_DAYS},ExD={EXPOSURE_DAYS})'
     
+    # Look-back windows. Prescriptions (LMED) and 1177 hotline contacts
+    # (Inera) are counted over the LOOKBACK_DAYS before each household's
+    # anchor date (feature_extraction.py: LMED_WINDOW / INERA_WINDOW). The
+    # earliest possible anchor date is the start of the SmiNet extract
+    # (STUDY_START), so these two tables must be kept from
+    # STUDY_START - LOOKBACK_DAYS onwards; otherwise households infected early
+    # in 2020 would get a truncated window. (An earlier version cut both
+    # tables at 2019-12-31, which gave an effective window of only a few days
+    # to 12 months, depending on the month of the household's first case.)
+    STUDY_START = '2019-12-31'
+    STUDY_END = '2020-12-31'
+    LOOKBACK_DAYS = 365
+    LOOKBACK_START = (pd.Timestamp(STUDY_START)
+                      - pd.Timedelta(days=LOOKBACK_DAYS))       # 2018-12-31
+
     # Time filtering configurations for multiple tables
     TIME_FILTER_CONFIGS = {
         'FHM_SMINET.csv': {
@@ -84,17 +99,17 @@ class Config:
             'assume_sorted': False
         },
         'Inera_VPTU_Coronadata.csv': {
-            'output_name': 'Inera_VPTU_Coronadata_2019_2020.csv',
+            'output_name': 'Inera_VPTU_Coronadata_2018_2020.csv',
             'date_column': 'documentCreatedTime',
-            'start_date': '20191231000000',
+            'start_date': LOOKBACK_START.strftime('%Y%m%d%H%M%S'),
             'end_date': '20201231000000',
             'date_format': '%Y%m%d%H%M%S',
             'assume_sorted': False
         },
         'SWECOV_SOS_LMED.csv': {
-            'output_name': 'SWECOV_SOS_LMED_2019_2020.csv',
+            'output_name': 'SWECOV_SOS_LMED_2018_2020.csv',
             'date_column': 'EDATUM',
-            'start_date': '20191231',
+            'start_date': LOOKBACK_START.strftime('%Y%m%d'),
             'end_date': '20201231',
             'date_format': '%Y%m%d',
             'assume_sorted': True
@@ -424,8 +439,8 @@ class TableSchema:
         'HushallBoende_2019.csv': ['P1105_LopNr_PersonNr', 'Boarea_Person', 'Boendeform'],
         'HushallPerson_2019.csv': ['P1105_LopNr_PersonNr', 'P1105_LopNr_Hushallsid_2019', 'AntalBarnUnder18'],
         'Individ_2019.csv': ['P1105_LopNr_PersonNr', 'DispInk04', 'DispInkFam04'],
-        'Inera_VPTU_Coronadata_2019_2020.csv': ['P1105_LopNr_PersonNr', 'documentCreatedTime', 'contactReason'],
-        'SWECOV_SOS_LMED_2019_2020.csv': ['P1105_LopNr_PersonNr', 'ATC', 'EDATUM'],
+        'Inera_VPTU_Coronadata_2018_2020.csv': ['P1105_LopNr_PersonNr', 'documentCreatedTime', 'contactReason'],
+        'SWECOV_SOS_LMED_2018_2020.csv': ['P1105_LopNr_PersonNr', 'ATC', 'EDATUM'],
         'SWECOV_SOS_OV.csv': ['P1105_LopNr_PersonNr', 'hdia', 'INDATUMA'],
         'SWECOV_SOS_SV.csv': ['P1105_LopNr_PersonNr', 'hdia', 'INDATUMA'],
         'SWECOV_SOS_DORS_2020.csv': ['P1105_LopNr_PersonNr', 'DODSDAT'],
@@ -579,7 +594,7 @@ class DictionarySchema:
             'columns': ['P1105_LopNr_PersonNr', 'DispInk04', 'DispInkFam04'],
             'value_format': lambda row: {'DispInk04': row['DispInk04'], 'DispInkFam04': row['DispInkFam04']}
         },
-        'Inera_VPTU_Coronadata_2019_2020.csv': {
+        'Inera_VPTU_Coronadata_2018_2020.csv': {
             'columns': ['P1105_LopNr_PersonNr', 'documentCreatedTime', 'contactReason'],
             'value_format': lambda row: {
                 'documentCreatedTime': row['documentCreatedTime'],
@@ -594,7 +609,7 @@ class DictionarySchema:
             'columns': ['P1105_LopNr_PersonNr', 'DODSDAT'],
             'value_format': lambda row: {'DODSDAT': row['DODSDAT']}
         },
-        'SWECOV_SOS_LMED_2019_2020.csv': {
+        'SWECOV_SOS_LMED_2018_2020.csv': {
             'columns': ['P1105_LopNr_PersonNr', 'ATC', 'EDATUM'],
             'value_format': lambda row: {'CodeDate': row['EDATUM'], 'Code': row['ATC']}
         },
