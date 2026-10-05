@@ -41,8 +41,8 @@ person-indexed extracts (file names as used in `feature_extraction.py`):
 | `HushallPerson_2019/2020` | `HushallPerson_2019_duplicates.pkl` | SCB household register (household-person linkage) | `AntalBarnUnder18` (number of children under 18 in household) |
 | `HushallBoende_2019/2020` | `HushallBoende_2019_duplicates.pkl` | SCB household register (household-housing linkage) | `Boarea_Person` (living area per person), `Boendeform` (housing/tenure type) |
 | `Individ_2017/2018/2019/2020` | `Individ_2019_duplicates.pkl` | SCB individual-level socioeconomic microdata | `DispInk04` (individual disposable income), `DispInkFam04` (family disposable income) |
-| `Inera 1177paTelefon` (call data to 1177) | `Inera_VPTU_Coronadata_2019_2020_duplicates.pkl` | Inera (Swedish eHealth infrastructure operator) -- 1177 Vårdguiden telephone/digital healthcare advice service | `contact_*` features (1177 call/contact reasons) |
-| `SWECOV_SOS_LMED` | `SWECOV_SOS_LMED_2019_2020_duplicates.pkl` | National Board of Health and Welfare (Socialstyrelsen) -- Prescribed Drug Register (Läkemedelsregistret) | `lmed_*` features (dispensed ATC-coded prescriptions) |
+| `Inera 1177paTelefon` (call data to 1177) | `Inera_VPTU_Coronadata_2018_2020_duplicates.pkl` | Inera (Swedish eHealth infrastructure operator) -- 1177 Vårdguiden telephone/digital healthcare advice service | `contact_*` features (1177 call/contact reasons) |
+| `SWECOV_SOS_LMED` | `SWECOV_SOS_LMED_2018_2020_duplicates.pkl` | National Board of Health and Welfare (Socialstyrelsen) -- Prescribed Drug Register (Läkemedelsregistret) | `lmed_*` features (dispensed ATC-coded prescriptions) |
 | `SWECOV_SOS_OV` | `SWECOV_SOS_OV_duplicates.pkl` | Socialstyrelsen -- National Patient Register, outpatient care (öppenvård) | `ov_*` features (ICD-10-coded outpatient diagnoses) |
 | `SWECOV_SOS_SV` | `SWECOV_SOS_SV_duplicates.pkl` | Socialstyrelsen -- National Patient Register, inpatient care (slutenvård) | `sv_*` features (ICD-10-coded inpatient/hospitalisation diagnoses) |
 | `SWECOV_SOS_SOL` | `SWECOV_SOS_SOL_2018_2020_duplicates.pkl` | Socialstyrelsen -- social services statistics (Socialtjänstlagen, SoL) | `TRYGG_*` features (municipal security-alarm / home-care service indicators) |
@@ -71,11 +71,26 @@ standard naming convention, not confirmed against SWECOV documentation.
 |---|---|---|---|
 | Demographic (age, sex, birth country, background) | Anchor date | Point-in-time (2020 snapshot) | `feature_aggregation.py::aggregate_household_features` |
 | Socioeconomic (income, housing, children count) | Anchor date | Point-in-time (2019 register year) | same |
-| `contact_*` (INERA) | Anchor date | 365 days before anchor date | `Config.INERA_WINDOW = 365`, `feature_extraction.py` |
-| `lmed_*` (prescriptions) | Anchor date | 365 days before anchor date | `Config.LMED_WINDOW = 365` |
-| `ov_*` (outpatient diagnoses) | Anchor date | All available history, strictly never after anchor date | `feature_extraction.py::count_codes`, no `window_days` |
-| `sv_*` (inpatient diagnoses) | Anchor date | All available history, strictly never after anchor date | same |
-| `TRYGG_*` | Anchor date | All available history in the SOL extract | `feature_extraction.py::count_trygg` |
+| `contact_*` (Inera 1177) | Anchor date | The 365 days up to and including the anchor date | `Config.INERA_WINDOW = 365`, `feature_extraction.py::count_codes` |
+| `lmed_*` (prescriptions) | Anchor date | The 365 days up to and including the anchor date | `Config.LMED_WINDOW = 365` |
+| `ov_*` (outpatient diagnoses) | Anchor date | All available history up to and including the anchor date | `feature_extraction.py::count_codes`, no `window_days` |
+| `sv_*` (inpatient diagnoses) | Anchor date | All available history up to and including the anchor date | same |
+| `TRYGG_*` (elderly care) | Anchor date | Calendar months that ended before the anchor date and started within the 365 days before it (records are monthly; the anchor month is excluded) | `Config.TRYGG_WINDOW = 365`, `feature_extraction.py::count_trygg` |
+
+**Extract periods and window coverage.** Every anchor date lies between
+2019-12-31 and 2020-12-31 (the SmiNet extract). So that the 365-day window is
+complete for every household, the prescription and 1177 extracts are kept from
+2018-12-31 (= 2019-12-31 − 365 days) to 2020-12-31
+(`data_preprocessing.py::Config.LOOKBACK_START`); the SOL extract covers
+2019-01 to 2020-12, which contains every 365-day window of completed months.
+`feature_extraction.py::check_lookback_coverage` reports, at run time, the
+earliest record in the prescription and 1177 extracts and the share of
+household members whose window would be truncated (expected: 0%; a warning is
+issued otherwise). An earlier version of the pipeline kept the
+prescription and 1177 extracts only from 2019-12-31, which shortened their
+window to between a few days and 12 months depending on the month of the
+household's first case, and counted elderly-care records without an upper date
+bound; both were corrected.
 
 In all cases every household member's features are anchored to the single earliest confirmed diagnosis date within the
 household, never to that member's own (possibly later) diagnosis date.
@@ -117,7 +132,7 @@ Sections 4 and 6 below.
 | `Boendeform_mode` → `Boendeform_mode_<category>` | Most common housing/tenure type, one-hot encoded | Household-Housing register | "unknown" category |
 | `mean_DispInk04` / `max_` / `min_` / `sd_` / `median_` / `range_DispInk04` | Household individual-disposable-income summary statistics | Socioeconomic Register | median |
 | `mean_DispInkFam04` / `max_` / `min_` / `sd_` / `median_` / `range_DispInkFam04` | Household family-disposable-income summary statistics | Socioeconomic Register | median |
-| `TRYGG_1_sum` / `TRYGG_total_sum` | Sum of security-alarm-type-1 / total elderly-care-service records | Elderly Care Register | 0 |
+| `TRYGG_1_sum` / `TRYGG_total_sum` | Sum of security-alarm-type-1 / total elderly-care-service monthly records in the look-back window (Section 2) | Elderly Care Register | 0 |
 | `any_TRYGG_1` / `any_TRYGG` | Indicators: household has any such record | derived | 0 |
 | `proportion_with_TRYGG` | Share of members with any such record | derived | 0 |
 | `TRYGG_1_per_elderly` / `TRYGG_total_per_capita` | Normalised by elderly-member count / household size | derived | 0 |
